@@ -1,0 +1,882 @@
+---
+title: "Sinduri data analysis"
+author: "Insang Song"
+date: "August 7, 2019"
+output: 
+  html_document: 
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(pacman)
+
+p_load(char = c('tidyverse', 'sf', 'readxl', 'naniar', 'stringr', 'raster', 'reshape2',
+                'visdat', 'VIM', 'mice', 'missForest', 'fitdistrplus', 'vegan', 'FactoMineR'))
+wsl <- FALSE
+
+cat(str_c('Be aware of your working directory'))
+if (grepl('*linux*', sessionInfo()[1]$R.version$os)){
+    if (wsl){
+        ddir <- '/mnt/s/'
+        bdir <- '/mnt/c/Users/sigma/Dropbox/'
+    } else {
+        ddir <- '/media/felix/Processing/'
+        bdir <- '/home/rstudio/Dropbox/'
+    }
+} else {
+    ddir <- 'S:/'
+    bdir <- 'C:/Users/sigma/Dropbox/'
+}
+
+```
+
+
+```{r original data}
+gdbdir <- str_c(bdir, 'DHK_Project/Sinduri/Orig_Data/Sinduri_Snap_Poly.gdb')
+polys <- st_layers(gdbdir)
+polys <- polys[[1]]
+
+polys.l <- polys %>% split(.,.) %>% 
+  lapply(function(x) st_read(dsn = gdbdir, layer = x))
+
+
+```
+
+```{r load data, echo=FALSE, message=FALSE}
+rlistl <- str_c(bdir, 'DHK_Project/Sinduri/Sinduri_Raster_180129') %>% 
+  list.files(path = .,
+             pattern = '*.img$',
+             full.names = TRUE) %>% 
+  split(.,.) %>% 
+  lapply(raster) %>% 
+  lapply(readAll)
+
+
+rlistll <- rlistl %>% 
+  lapply(as.matrix) %>% 
+  lapply(reshape2::melt) %>% 
+  mapply(function(x, y) x %>% mutate(time = y) %>% rename(ROW = Var1, COL = Var2),
+         ., 1:14 %>% split(.,.), SIMPLIFY = FALSE)
+names(rlistll) <- 1:14
+rlistdf <- Reduce('rbind', rlistll)
+# rlistdf <- rbind(rlistll[[1]], ..., rlistll[[14]])
+species <- str_c(bdir, 'DHK_Project/Sinduri/Basic analysis_190218.xlsx') %>% 
+  readxl::read_excel(sheet = 4)
+```
+
+## Environmental variables
+```{r plot1, echo=FALSE, fig.width=8, fig.height=15}
+par(mfrow=c(5,3))
+plot(rlistl[[1]], breaks=seq(1,66,1));plot(rlistl[[2]], breaks=seq(1,66,1));plot(rlistl[[3]], breaks=seq(1,66,1))
+plot(rlistl[[4]], breaks=seq(1,66,1));plot(rlistl[[5]], breaks=seq(1,66,1));plot(rlistl[[6]], breaks=seq(1,66,1))
+plot(rlistl[[7]], breaks=seq(1,66,1));plot(rlistl[[8]], breaks=seq(1,66,1));plot(rlistl[[9]], breaks=seq(1,66,1))
+plot(rlistl[[10]], breaks=seq(1,66,1));plot(rlistl[[11]], breaks=seq(1,66,1));plot(rlistl[[12]], breaks=seq(1,66,1))
+plot(rlistl[[13]], breaks=seq(1,66,1));plot(rlistl[[14]], breaks=seq(1,66,1))
+```
+```{r EGV import, echo=FALSE, fig.width=8, fig.height=7}
+egv.elev <- raster(str_c(bdir, 'DHK_Project/Sinduri/Environmental_Variables/DEM_Resample.img'))
+egv.slope <- raster(str_c(bdir, 'DHK_Project/Sinduri/Environmental_Variables/Sinduri_Slope_Re.img'))
+egv.wind <- raster(str_c(bdir, 'DHK_Project/Sinduri/Environmental_Variables/Sinduri_Windward_Index_Re.img'))
+egv.dist.shore <- raster(str_c(bdir, 'DHK_Project/Sinduri/Environmental_Variables/Sinduri_Distance_Coast.img'))
+egv.dist.trail <- raster(str_c(bdir, 'DHK_Project/Sinduri/Environmental_Variables/Sinduri_Distance_From_Road.img'))
+egv.aspect <- raster(str_c(bdir, 'DHK_Project/Sinduri/Environmental_Variables/Sinduri_Aspect_Linear_Re.img'))
+
+```
+
+
+```{r}
+# Leave only invasive species codes
+rlistdf.fi <- rlistdf %>% mutate(value=ifelse(grepl('(13|16|23|25|36|38|51|64)', value), value, NA))
+# mutate(value = (value == 13 | value == 16 | ... | value == 64))
+```
+
+## Summary Table and T-tests
+```{r SJT-Table, echo=FALSE}
+mat.elev <- egv.elev %>% as.matrix %>% 
+  reshape2::melt(., na.rm=TRUE) %>% 
+  rename(ROW=Var1, COL=Var2, elev=value)
+mat.slope <- egv.slope %>% as.matrix %>% 
+  reshape2::melt(., na.rm=TRUE) %>% 
+  rename(ROW=Var1, COL=Var2, slope=value)
+mat.wind <- egv.wind %>% as.matrix %>% 
+  reshape2::melt(., na.rm=TRUE) %>% 
+  rename(ROW=Var1, COL=Var2, wind=value)
+mat.dist.s <- egv.dist.shore %>% as.matrix %>% 
+  reshape2::melt(., na.rm=TRUE) %>% 
+  rename(ROW=Var1, COL=Var2, dshore=value)
+mat.dist.t <- egv.dist.trail %>% as.matrix %>% 
+  reshape2::melt(., na.rm=TRUE) %>% 
+  rename(ROW=Var1, COL=Var2, dtrail=value)
+mat.aspect <- egv.aspect %>% as.matrix %>% 
+  reshape2::melt(., na.rm=TRUE) %>% 
+  rename(ROW=Var1, COL=Var2, aspect=value)
+
+# Generate a full data frame with EGV attributes and cell addresses
+rlistdf.a <- rlistdf %>% 
+  filter(!is.na(value)) %>% 
+  mutate(value = grepl('(13|16|23|25|36|38|51|64)', value)) %>% 
+  group_by(ROW, COL) %>% 
+  dplyr::summarize(value = ifelse(sum(value) > 0, 1, ifelse(is.na(sum(value)), NA, 0))) %>% ungroup
+rlistdf.st <- rlistdf.a %>% 
+  left_join(mat.elev) %>% 
+  left_join(mat.slope) %>% 
+  left_join(mat.wind) %>% 
+  left_join(mat.dist.s) %>% 
+  left_join(mat.dist.t) %>% 
+  left_join(mat.aspect) %>% 
+  mutate(class=factor(value), pres=value)
+rlistdf.st <- rlistdf.st %>% .[complete.cases(.),]
+
+# T-test by presence
+t.test(elev~pres, rlistdf.st)
+t.test(slope~pres, rlistdf.st)
+t.test(wind~pres, rlistdf.st)
+t.test(dshore~pres, rlistdf.st)
+t.test(dtrail~pres, rlistdf.st)
+t.test(aspect~pres, rlistdf.st)
+
+```
+
+
+```{r Recode and rasterize}
+# Species table: recode
+species <- species %>% mutate(CLASSINV=ifelse(is.na(CLASS3), 0, CLASS3),
+                              CLASSDUNE=ifelse(is.na(CLASS5), 0, CLASS5))
+
+
+## Workflow: analyze data frame then convert it to matrix and raster
+## data.frame -> matrix -> raster
+## raster stage: set extent, etc.
+rlistdf.cl <- rlistdf %>% filter(time != 1) %>% 
+  group_by(ROW, COL) %>% 
+  dplyr::summarize(cleared_once = ifelse(sum(value == 18) > 0, 1, 0)) %>% 
+  ungroup 
+rlistmat.cl <- rlistdf.cl %>% 
+  spread(., key = COL, value = cleared_once) %>% 
+  dplyr::select(-1) %>% 
+  as.matrix %>% raster
+extent(rlistmat.cl) <- extent(rlistl[[1]])
+
+# Recode 1
+# Recode: Invasive or not
+rlistdf.ch <- rlistdf %>% mutate(value = plyr::mapvalues(value, species$CLASS, species$CLASS3))
+# Recode: Dune or not
+rlistdf.dun <- rlistdf %>% mutate(value = plyr::mapvalues(value, species$CLASS, species$CLASS5))
+
+rlistdf.ch <- rlistdf.ch %>% group_by(ROW, COL) %>% 
+  dplyr::summarize(mask = ifelse(sum(value, na.rm=T) > 0, 1, NA)) %>% 
+  ungroup
+rlistdf.dun <- rlistdf.dun %>% group_by(ROW, COL) %>% 
+  dplyr::summarize(mask = ifelse(sum(value, na.rm=T) > 0, 1, NA)) %>% 
+  ungroup
+
+
+# Recode to matrix
+rlistmat.ch <- rlistdf.ch %>% ungroup() %>% 
+  spread(., key = COL, value = mask) %>% 
+  dplyr::select(-1) %>% as.matrix
+rlistmat.dun <- rlistdf.dun %>% ungroup() %>% 
+  spread(., key = COL, value = mask) %>% 
+  dplyr::select(-1) %>% as.matrix
+
+# matrix to raster
+rlistras.ch <- raster(rlistmat.ch)
+rlistras.dun <- raster(rlistmat.dun)
+extent(rlistras.dun) <- extent(rlistras.ch) <- extent(rlistl[[1]])
+
+#
+rlistmat.both <- rlistmat.ch + rlistmat.dun
+rlistras.both <- raster(rlistmat.both)
+extent(rlistras.both) <- extent(rlistl[[1]])
+
+
+
+rlistch.fin <- rlistdf.ch %>% 
+  left_join(rlistdf.cl, by=c('ROW','COL')) %>%
+  mutate(invmask = mask*cleared_once)
+rlistmat.fin <- rlistch.fin %>% dplyr::select(-3:-4) %>% 
+  spread(., key=COL, value=invmask) %>% 
+  dplyr::select(-1) %>% as.matrix %>% raster
+rlistmat.dunf <- rlistmat.cl * rlistras.dun # cleared-once and dune-once
+extent(rlistmat.fin) <- extent(rlistl[[1]])
+
+## should filter once-cleared
+rlistdf.cha <- rlistdf %>% 
+  mutate(value = plyr::mapvalues(value, species$CLASS, species$CLASSINV))
+rlistdf.duna <- rlistdf %>% 
+  mutate(value = plyr::mapvalues(value, species$CLASS, species$CLASSDUNE))
+
+rlistdf.ch.w <- rlistdf.cha %>% 
+  spread(key = time, value = value)
+rlistdf.dun.w <- rlistdf.duna %>% 
+  spread(key = time, value = value)
+
+rlistdf.both <- rlistdf.ch.w
+rlistdf.both[,-1:-2] <- rlistdf.both[,-1:-2] + rlistdf.dun.w[,-1:-2]
+```
+
+
+```{r Change detection}
+# Change detection: Be careful! somewhat complicated to understand
+# Recode to matrix: two-class presence-absence change detection
+# Mind a 2x2 matrix:
+#Invasive # Y  N 
+# Dune    Y 6  5
+#         N 4  3
+# Note that 6 cannot appear in the change trajectory matrix due to no co-occurrence
+rdf.ch <- rlistdf %>% 
+  mutate(value = plyr::mapvalues(value, species$CLASS, ifelse(species$CLASS3==1,1,0))) %>% 
+  spread(., key=time, value=value)
+rdf.dun <- rlistdf %>% 
+  mutate(value = plyr::mapvalues(value, species$CLASS, ifelse(species$CLASS5==1, 5, 3))) %>% 
+  spread(., key=time, value=value)
+
+rdf.cd <- rdf.ch
+rdf.cd[,-1:-2] <- rdf.cd[,-1:-2] + rdf.dun[,-1:-2]
+
+rdf.cl <- rlistdf.cl %>% 
+  mutate(cleared_once = ifelse(cleared_once==0, NA, cleared_once))
+rdf.cda <- rdf.cd %>% 
+  left_join(rdf.cl, by=c('ROW','COL')) %>% 
+  mutate_at(.vars=vars(3:16), .funs = list(~.*cleared_once))
+rdf.cdam <- rdf.cda %>% 
+  mutate(con = paste(`2`,`3`,`4`,`5`,`6`,`7`,`8`,`9`,`10`,`11`,`12`,`13`,`14`,sep=''),
+         cond1 = grepl('*.(5)*.*(4).*', con),
+         inv_mask = ifelse(grepl('.(4).', con) | grepl('*.(5)*.*(4).*|*.(4)$', con), 1, NA), # Invasive (at least once)
+         dune_mask = ifelse(grepl('*.(5).*', con) & !grepl('*.(5)*.*(4).*|*.(4)$', con), 1, NA),
+         inv_mask_n = ifelse(grepl('*.(4).*', con) & !grepl('*.(5)$', con), 1, 0),
+         dune_mask_n = ifelse(grepl('*.(5).*', con) & !grepl('*.(5)*.*(4).*|*.(4)$', con), 2, 0)) # Dune (at least once)
+
+rdf.inv <- rdf.cdam %>% 
+  dplyr::select(ROW, COL, inv_mask) %>% 
+  spread(key=COL, value=inv_mask) %>% 
+  dplyr::select(-1) %>% 
+  as.matrix %>% raster
+rdf.dune <- rdf.cdam %>% 
+  dplyr::select(ROW, COL, dune_mask) %>% 
+  spread(key=COL, value=dune_mask) %>% 
+  dplyr::select(-1) %>% 
+  as.matrix %>% raster
+
+# Clip rdf.inv, rdf.dune to the actual extent of study area
+rdf.invn <- rdf.cdam %>% 
+  dplyr::select(ROW, COL, inv_mask_n) %>% 
+  spread(key=COL, value=inv_mask_n) %>% 
+  dplyr::select(-1) %>% 
+  as.matrix %>% raster
+rdf.dunn <- rdf.cdam %>% 
+  dplyr::select(ROW, COL, dune_mask_n) %>% 
+  spread(key=COL, value=dune_mask_n) %>% 
+  dplyr::select(-1) %>% 
+  as.matrix %>% raster
+extent(rdf.invn) <- extent(rdf.dunn) <- extent(rlistl[[1]])
+
+crs(rdf.invn) <- crs(rdf.dunn) <- crs(rlistl[[1]])
+rdf.invn <- raster::mask(rdf.invn, rlistl[[1]])
+rdf.dunn <- raster::mask(rdf.dunn, rlistl[[1]])
+rdf.invdun <- rdf.invn + (rdf.dunn * 2)
+
+
+```
+
+
+```{r Reinvasion analysis}
+# read values from disk to memory
+rlistll <- lapply(rlistl, readAll)
+
+# conform reclass matrices to the input format of raster::subs
+rcl.matrix3 <- as.data.frame(species %>% dplyr::select(CLASS, CLASS3))
+rcl.matrix5 <- as.data.frame(species %>% dplyr::select(CLASS, CLASS5))
+colnames(rcl.matrix3) <- colnames(rcl.matrix5) <- c('id', 'v')
+
+rlistll.invdun <- rlistl %>% # rlistll to rlistl @ 190218
+  lapply(function(x) {
+    x1 <- subs(x, rcl.matrix3)
+    x2 <- subs(x, rcl.matrix5)
+    # layer 1: invaded species
+    # layer 2: dune species
+    x12 <- stack(x1, x2)
+    return(x12)})
+
+# Check it visually
+par(mfrow = c(3,5), mar=c(1,0.5,0.5,0.75), mai = rep(0.5,4))
+plot(rlistll.invdun[[1]])
+plot(rlistll.invdun[[2]])
+plot(rlistll.invdun[[3]])
+plot(rlistll.invdun[[4]])
+plot(rlistll.invdun[[5]])
+plot(rlistll.invdun[[6]])
+plot(rlistll.invdun[[7]])
+plot(rlistll.invdun[[8]])
+plot(rlistll.invdun[[9]])
+plot(rlistll.invdun[[10]])
+plot(rlistll.invdun[[11]])
+plot(rlistll.invdun[[12]])
+plot(rlistll.invdun[[13]])
+plot(rlistll.invdun[[14]])
+
+
+rdf.cdam.reh <- rdf.cdam %>% filter(`1`==4) %>% 
+  mutate(reinvade = ifelse(grepl('*.(4).*', con), 1, 0), 
+         reinvade_ex = ifelse(grepl('*.(4).*', con) & !grepl('*.(5)$', con), 1, 0))
+rdf.cdam.j <- rdf.cdam.reh %>% 
+  filter(reinvade == 1) %>% 
+  dplyr::select(ROW, COL, reinvade)
+rdf.full <- rdf.cdam %>% dplyr::select(ROW, COL, cond1) %>% 
+  left_join(rdf.cdam.j) %>% 
+  mutate(class = ifelse(!is.na(reinvade), reinvade, ifelse(is.na(cond1), NA, 0)))
+rdf.full.spr <- rdf.full %>% 
+  mutate(ROW = -ROW) %>% 
+  data.frame
+rdf.full.ras <- rasterFromXYZ(rdf.full.spr[,c('COL','ROW','class')])
+extent(rdf.full.ras) <- extent(egv.elev)
+
+
+### Model raster: to retain the core attributes of raster
+elev_m <- egv.elev %>% as.matrix %>% as.data.frame
+colnames(elev_m) <- 1:567
+elev_m <- elev_m %>% mutate(ROW = 1:593) %>% gather(key = COL, value = elev, 1:567) %>% 
+  mutate(COL = as.integer(COL))
+
+rdf.fulls <- elev_m %>% left_join(rdf.full) %>% 
+  mutate(class = ifelse(!is.na(reinvade), reinvade, ifelse(is.na(elev), NA, 0)),
+         ROW = -ROW) %>% 
+  data.frame
+rdf.fulls.ras <- rasterFromXYZ(rdf.fulls[,c('COL','ROW','class')])
+extent(rdf.fulls.ras) <- extent(egv.elev)
+plot(rdf.fulls.ras)
+rdf.fulls.ras <- raster::mask(rdf.fulls.ras, egv.elev)
+
+
+## Make 3826 and 491
+## 491: rdf.fulls.ras
+## 5030 (invasive species in the first season): rlistll.invdun[[1]]@layers[[1]]
+## 3826: cells out of 5030 subject to clearance: mask.cl
+## study area mask: mask.sa
+mask.cl <- rlistl[[2]]
+mask.cl@data@values <- ifelse(mask.cl@data@values %>% is.na, NA, ifelse(mask.cl@data@values == 18, 1, 0))
+mask.sa <- rlistl[[2]]
+mask.sa@data@values <- ifelse(is.na(mask.sa@data@values), NA, 1)
+
+#rdf.invn %>% plot
+rlistll.invdun[[1]]@layers[[1]] %>% 
+  raster::mosaic(mask.cl, fun = sum) %>% 
+  raster::mosaic(mask.sa, fun = sum) -> season1.invasive
+season1.invasive@data@values <- ifelse(is.na(season1.invasive@data@values), NA, 
+                                       ifelse(season1.invasive@data@values == 0, NA,
+                                              ifelse(season1.invasive@data@values == 3, 1, 0)))
+season1.invasive.full <- season1.invasive + rdf.fulls.ras
+
+
+# contour: rasterToContour
+season1.invasive %>% rasterToContour(maxpixels = 1e6) %>% st_as_sf -> invasive_extent_all
+season1.invasive.full %>% rasterToContour(maxpixels = 1e6) %>% st_as_sf -> invasive_extent
+invasive_extent_re <- invasive_extent %>% subset(level == 2) %>% st_cast('POLYGON')
+
+
+# target data
+invasive.full <- season1.invasive.full
+invasive.full@data@values <- ifelse(invasive.full@data@values == 2, 1, ifelse(invasive.full@data@values == 1, 0, NA))
+
+
+```
+
+```{r reinvasive_by_class}
+rlistdf.t <- rlistdf %>% left_join(rdf.cdam.j) %>% 
+  filter(reinvade == 1)
+
+rlistdf.ts <- rlistdf.t %>% 
+  group_by(time, value) %>% 
+  summarize(Ncell = n()) %>% 
+  ungroup %>% 
+  spread(key = value, value = Ncell)
+#write.csv(rlistdf.ts, str_c(bdir, 'DHK_Project/Sinduri/Reinhabit_Cell_by_Cell_Analysis_190804.csv'),
+#          row.names = F)
+
+
+```
+
+```{r ENFA in reinhabited}
+library(adehabitatHS)
+
+season1.inv.mask <- (season1.invasive.full > 0)
+season1.inv.mask@data@values <- ifelse(season1.inv.mask@data@values == 0, NA, 1)
+# make raster stack for env variables
+rastack.px <- stack(egv.elev, egv.slope, egv.dist.shore, egv.dist.trail, egv.aspect, egv.wind, invasive.full) %>% 
+  mask(season1.inv.mask)
+
+rastack.px <- rastack.px %>% as('SpatialPixelsDataFrame')
+rastack.px <- rastack.px %>% subset(!is.na(layer))
+#rastack.px@data <- rastack.px@data %>% filter(!is.na(layer))
+colnames(rastack.px@data) <- c('elevation', 'slope', 'dshore', 'dtrail', 'aspect', 'wind', 'reinvasion')
+
+## ENFA
+## dudi.pca
+dpca.ri <- dudi.pca(rastack.px@data[,1:6], scannf = FALSE, nf = 3, center = T)
+## ENFA analysis with 3 axes
+dpca.enfa <- enfa(dpca.ri, rastack.px@data$reinvasion, scannf= FALSE, nf = 4)
+
+
+## Table 1 recreated
+psych::describeBy(x = rastack.px@data[,1:6], group = rastack.px@data$reinvasion, mat = TRUE)
+t.test(dtrail ~ reinvasion, data = rastack.px@data)
+t.test(elevation ~ reinvasion, data = rastack.px@data)
+t.test(wind ~ reinvasion, data = rastack.px@data)
+t.test(dshore ~ reinvasion, data = rastack.px@data)
+t.test(slope ~ reinvasion, data = rastack.px@data)
+t.test(aspect ~ reinvasion, data = rastack.px@data)
+
+## Reassembly ENFA results as Table 2 in Kim et al. 2019
+egv <- dpca.enfa$s
+egv.p <- 100 * egv / sum(egv)
+enfa.co <- dpca.enfa$co
+
+enfa.df.tab2 <- rbind(egv, egv.p, enfa.co)
+  
+
+
+```
+```{r Data export}
+png(str_c(bdir, 'DHK_Project/Sinduri/ENFA_Reinhabited_Coordplot_190805.png'),
+    width = 30, height = 30, units = 'cm', res = 600, pointsize = 24)
+scatter(dpca.enfa, 1)
+dev.off()
+
+png(str_c(bdir, 'DHK_Project/Sinduri/ENFA_Reinhabited_Histogram_190805.png'),
+    width = 30, height = 30, units = 'cm', res = 600, pointsize = 24)
+hist(dpca.enfa)
+dev.off()
+
+write.csv(enfa.df.tab2,
+          str_c(bdir, 'DHK_Project/Sinduri/ENFA_Reinvasion_190805.csv'))
+#rownames(enfa.df.tab2) <- c(NA, NA, )
+
+```
+
+# Plots
+```{r plot-new}
+# create a palette
+pals <- c(terrain.colors(5)[5], 'red', 'light blue')
+# make a boundary polygon of the cleared area
+season1.inv <- season1.invasive
+season1.inv <- calc(season1.inv, function(x) ifelse(x == 1, x, NA))
+ext.season1 <- c(128175, 128375, 371675, 371875)
+season1.inv <- crop(season1.inv, extent(ext.season1))
+cd.list <- lapply(rlistl, function(x) {crop(x, season1.inv)})
+cd.list <- lapply(cd.list, function(x) mask(x, season1.inv))
+cd.list <- lapply(cd.list, function(x) calc(x, function(x) ifelse(x %in% c(13, 16, 25), 2, ifelse(x == 18, 1, 0))))
+
+# rasterToPolygons: raster to sp in terms of raster values (the 'layer' or 'value' field)
+season1.invpol <- rasterToPolygons(season1.inv, na.rm = T, dissolve = T)
+season1.invpol <- as(season1.invpol, 'SpatialLinesDataFrame')
+#cd.list <- lapply(cd.list, function(x) {x <- asFactor(x); return(x)})
+cd.all <- cd.list %>% Reduce(raster::stack, .)
+cd.all <- stack(calc(season1.inv, function(x) return(NA)), cd.all)
+
+
+## Import the trail (hand drawing)
+trail <- st_read(str_c(bdir, 'DHK_Project/Sinduri/Trail_cut.shp'))
+
+#vir.pal <- viridisLite::viridis(60)
+#vir.pal <- vir.pal[length(vir.pal):1]
+vir.pal <- c('azure', 'light grey', 'red')
+# a function which cover the polygon onto each panel (note that we stacked all the single rasters)
+fun <- function() {
+    plot(season1.invpol, lty = 2, lwd = 2, add = T)
+    plot(as(trail, 'Spatial'), , lty = 3, col = 'azure', lwd = 2.2, add = T)
+}
+
+# export the graph
+png('/home/felix/Dropbox/DHK_Project/Sinduri/Stack_every.png', width = 38, height = 52, units = 'cm', res = 300)
+par(mai = rep(0.3, 4), mar = rep(0,4))
+plot(cd.all, legend = FALSE, box = FALSE, axes = F, 
+     col = vir.pal, main = NULL, 
+     nc = 3, nr = 5, addfun = fun)
+dev.off()
+
+# extract the once-cleared area and make it a polygon
+mask.clp <- mask.cl %>% calc(., function(x) x==1) %>% rasterToPolygons(na.rm = T, dissolve = T)
+mask.clp <- mask.clp %>% subset(layer == 1)
+# the polygon which delineates the cells initially occupied by invasive species at the beginning of the study period
+mask.invp <- season1.invasive %>% calc(., function(x) x==1) %>% rasterToPolygons(na.rm = T, dissolve = T)
+mask.invp <- mask.invp %>% subset(layer == 1)
+
+
+# Export a map of the study area
+png(str_c(bdir, 'DHK_Project/Sinduri/Sindu_Clear_Unclear_190810.png'),
+    width = 30, height = 33, units = 'cm', res = 300, pointsize = 24)
+par(mar = rep(0.5, 4)) # requires the understanding on graphical parameters, mar, mai, etc.
+# plot the raster with cleared and invasive cells
+season1.invasive.full %>% plot(col = c(terrain.colors(30)[30], 'light grey', 'red'), bty = 'n', axes = F, box = F, legend = F)
+# the area with massively cleared and occupied by invasive species at the season 1
+plot(mask.invp, add = T, lty = 2, lwd = 4)
+plot(mask.clp, add = T, lty = 1, lwd = 4)
+plot(trail %>% st_geometry, add = T, lty = 1, lwd = 3, col = 'azure3')
+dev.off()
+
+
+
+```
+
+```{r 3D plot}
+## plot3D (190801)
+
+svg(str_c(bdir, 'DHK_Project/Sinduri/Perspective_Plot_New_Studyarea_190810.svg'), width=12, height=8,  pointsize = 12)
+plot3D::persp3D(z = as.matrix(egv.elev),# Which matrix to be used as extrusion values (must be a matrix)
+                border = 'light grey', # the color of the cell boundary
+                lwd = 0.175, # the width of the boundary of each cell
+                colvar = as.matrix(season1.invasive.full), # which field to be used as a coloring measure
+                phi = 30, theta = -40, 
+                col = c('white', 'light grey', 'red'), # a color palette which will fill the values corresponding to the unique values-- in this case, white to 0, light grey to 1, and red to 2
+                colkey = TRUE, # a color key
+                #lighting = list('specular'),
+                zlim=c(4,18), # to limit z values to make the plot compact
+                expand=0.2, # to exaggerate z (1/expand) times -- in this case, (1/0.2)=5 times
+                resfac = 0.33, # how much you want to coarsen the raster -- in this case, (1/0.33)=3 meters resolution
+        curtain = FALSE, # 	If TRUE, the ribbon or persp edges will be draped till the bottom.
+        box = T, # should the bounding box for the surface be displayed. The default is TRUE.
+        labels = NULL, # don't print labels along all axes
+        d = 1, # a value which can be used to vary the strength of the perspective transformation
+        r = 0, # the distance of the eyepoint from the center of the plotting box
+        legend = FALSE)
+#scatter3D(trailzdf$X, trailzdf$Y, trailzdf$Z, lwd = 2, col = 'black', type = 'l', add = T, expand = 0.2)
+dev.off()
+
+```
+
+```{r Deprecated below (boxplot)}
+## Deprecated
+par(mfrow=c(5,3), mai=rep(0.5,4), mar=rep(0,4))
+plot(0, type='n', axes=F, ann=F)
+plot(mask.sa, axes=F, useRaster=F, bty='n', legend.mar=0.5, legend=F, box=F, col = c(terrain.colors(5)[5]))
+plot(st_geometry(invasive_extent_re), add = T, col = 'red', fill = 'red', )
+plot(st_geometry(invasive_extent_all), lty = 2, lwd = 1.5, add = T)
+plot(cd.list[[1]], axes=F, useRaster=F, bty='n', legend.mar=0.5, legend=F, box=F, col = pals)
+plot(st_geometry(invasive_extent), add=T, border='black', lty=2, lwd=1.5)
+plot(st_geometry(trails.cut), add=T, lwd=1, col='blue')
+plot(cd.list[[2]], axes=F, useRaster=F, bty='n', legend.mar=0.5, legend=F, box=F, col = c(terrain.colors(5)[5]))
+plot(st_geometry(invasive_extent), add=T, border='black', lty=2, lwd=1.5)
+plot(st_geometry(trails.cut), add=T, lwd=1, col='blue')
+plot(cd.list[[3]], axes=F, useRaster=F, bty='n', legend.mar=0.5, legend=F, box=F, col = c(terrain.colors(5)[5]))
+plot(st_geometry(invasive_extent), add=T, border='black', lty=2, lwd=1.5)
+plot(st_geometry(trails.cut), add=T, lwd=1, col='blue')
+plot(cd.list[[4]], axes=F, useRaster=F, bty='n', legend.mar=0.5, legend=F, box=F, col = pals)
+plot(st_geometry(invasive_extent), add=T, border='black', lty=2, lwd=1.5)
+plot(st_geometry(trails.cut), add=T, lwd=1, col='blue')
+plot(cd.list[[5]], axes=F, useRaster=F, bty='n', legend.mar=0.5, legend=F, box=F, col = pals)
+plot(st_geometry(invasive_extent), add=T, border='black', lty=2, lwd=1.5)
+plot(st_geometry(trails.cut), add=T, lwd=1, col='blue')
+plot(cd.list[[6]], axes=F, useRaster=F, bty='n', legend.mar=0.5, legend=F, box=F, col = pals)
+plot(st_geometry(invasive_extent), add=T, border='black', lty=2, lwd=1.5)
+plot(st_geometry(trails.cut), add=T, lwd=1, col='blue')
+plot(cd.list[[7]], axes=F, useRaster=F, bty='n', legend.mar=0.5, legend=F, box=F, col = pals)
+plot(st_geometry(invasive_extent), add=T, border='black', lty=2, lwd=1.5)
+plot(st_geometry(trails.cut), add=T, lwd=1, col='blue')
+plot(cd.list[[8]], axes=F, useRaster=F, bty='n', legend.mar=0.5, legend=F, box=F, col = pals)
+plot(st_geometry(invasive_extent), add=T, border='black', lty=2, lwd=1.5)
+plot(st_geometry(trails.cut), add=T, lwd=1, col='blue')
+plot(cd.list[[9]], axes=F, useRaster=F, bty='n', legend.mar=0.5, legend=F, box=F, col = pals)
+plot(st_geometry(invasive_extent), add=T, border='black', lty=2, lwd=1.5)
+plot(st_geometry(trails.cut), add=T, lwd=1, col='blue')
+plot(cd.list[[10]], axes=F, useRaster=F, bty='n', legend.mar=0.5, legend=F, box=F, col = pals)
+plot(st_geometry(invasive_extent), add=T, border='black', lty=2, lwd=1.5)
+plot(st_geometry(trails.cut), add=T, lwd=1, col='blue')
+plot(cd.list[[11]], axes=F, useRaster=F, bty='n', legend.mar=0.5, legend=F, box=F, col = pals)
+plot(st_geometry(invasive_extent), add=T, border='black', lty=2, lwd=1.5)
+plot(st_geometry(trails.cut), add=T, lwd=1, col='blue')
+plot(cd.list[[12]], axes=F, useRaster=F, bty='n', legend.mar=0.5, legend=F, box=F, col = pals)
+plot(st_geometry(invasive_extent), add=T, border='black', lty=2, lwd=1.5)
+plot(st_geometry(trails.cut), add=T, lwd=1, col='blue')
+plot(cd.list[[13]], axes=F, useRaster=F, bty='n', legend.mar=0.5, legend=F, box=F, col = pals)
+plot(st_geometry(invasive_extent), add=T, border='black', lty=2, lwd=1.5)
+plot(st_geometry(trails.cut), add=T, lwd=1, col='blue')
+plot(cd.list[[14]], axes=F, useRaster=F, bty='n', legend.mar=0.5, legend=F, box=F, col = pals)
+plot(st_geometry(invasive_extent), add=T, border='black', lty=2, lwd=1.5)
+plot(st_geometry(trails.cut), add=T, lwd=1, col='blue')
+
+
+# group 1
+#df1 <- mat.combined %>% mutate(class = 'All')
+
+# group 2: 
+df2 <- rdf.cdam.reh %>% #rename(ROW = Var1, COL = Var2) %>% 
+  left_join(rlistdf.st) %>% mutate(class = 'Preinvaded area')
+# group 3:
+df3 <- rdf.cdam.j %>% filter(!is.na(reinvade)) %>% 
+  #rename(ROW = Var1, COL = Var2) %>% 
+  left_join(rlistdf.st) %>% mutate(class = 'Reinvaded area')
+# group 4:
+df4 <- rdf.cdam.reh %>% 
+  anti_join(rdf.cdam.j %>% filter(!is.na(reinvade)), by = c('ROW', 'COL')) %>% 
+  #rename(ROW = Var1, COL = Var2) %>% 
+  left_join(rlistdf.st) %>% mutate(class = 'Cleared area')
+
+df.all <- bind_rows(df2, df3, df4) %>% 
+  dplyr::select(1:2, 27:32, class) %>%
+  gather(key = variable, value = attribute, 3:8) %>% 
+  mutate(class = factor(class, levels = c('Preinvaded area', 'Reinvaded area', 'Cleared area')))
+
+gg.varbox <- ggplot(data = df.all %>% 
+                      mutate(variable = plyr::mapvalues(variable, 
+                                                         c('aspect', 'dshore', 'dtrail', 'elev', 'slope', 'wind'), c('Aspect\n(unitless)', 'Distance to shoreline\n(meter)', 'Distance to trails\n(meter)', 'Elevation\n(meter)', 'Slope\n(degree)', 'Windward index\n(unitless)'))),
+                             #class = plyr::mapvalues(class,
+                             #                       c('Pre-invaded area', 'Reinvaded area', 'Cleared area'),
+                             #                         c('Study area', 'Reinvaded area', 'Cleared area'))),
+                     mapping = aes(group = class, x = class, y = attribute)) +
+  facet_wrap(~variable, ncol = 3, scales = 'free') +
+  geom_boxplot(show.legend = TRUE, cex = 0.8) +
+  theme_bw() +
+  ylab(NULL) + xlab(NULL) +
+  #ggthemes::scale_color_tableau() +
+  theme(legend.position = 'none',
+        axis.text = element_text(size = 16),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        strip.text = element_text(size = 16),
+        axis.text.x = element_text(hjust = 1, angle = 30))
+
+gg.varbox
+
+gg.varbox %>% ggsave(filename = str_c(bdir, 'DHK_Project/Sinduri/Extended_Analysis_Distribution.png'),
+                     plot = .,
+                     width = 36, height = 30, dpi = 300, units='cm', scale = 0.67)
+
+write.csv(df.all, str_c(bdir, 'DHK_Project/Sinduri/Extended_Analysis_Table.csv'), row.names = F)
+
+```
+
+
+
+
+## ETC (may be deprecated later; 190806)
+```{r}
+elev.ext <- raster(matrix(rep(0, 594*568), nrow=594))
+extent(elev.ext) <- extent(elev)
+crs(elev.ext) <- crs(elev)
+#raster::interpolate(elev, fields::Tps(elev.ext, elev@data@values))
+elev.extr <- resample(elev, elev.ext)
+elev.extra <- as.matrix(elev.extr)
+
+
+rfrvals <- rdf.fulls.ras@data@values[which(!is.na(rdf.fulls.ras@data@values))]
+rfrvals <- rdf.fulls.ras %>% as.matrix %>% as.vector %>% .[which(!is.na(.))]
+
+png('/mnt/c/Users/sigma/Documents/Test_3DPersp_180715.png', width = 30, height = 25, units = 'cm', res = 600)
+svg('/mnt/c/Users/sigma/Dropbox/DHK_Project/Sinduri/Perspective_Plot_reoccupation.svg', width=8, height=6,  pointsize = 12)
+par(mar=rep(1,4), mai=rep(1,4))
+plot3D::persp3D(z = as.matrix(elev),#elev.extra, 
+                border = 'light grey', lwd = 0.33, 
+                colvar = as.matrix(rdf.fulls.ras),#rfrvals, 
+                phi = 40, theta = 60, col = c('white', 'red'), colkey = FALSE,
+                zlim=c(4,18),
+                expand=0.25, resfac = 0.2,
+        curtain = FALSE, box = T,
+        d = 2, r = 0,
+        legend = FALSE)
+dev.off()
+
+## New order: in once-invasive
+rdfs <- (season1.invasive*10) + (rdf.fulls.ras * 100)
+rdfss <- rdfs + 1
+rdfss@data@values <- as.factor(rdfss@data@values)
+
+svg('/mnt/c/Users/sigma/Dropbox/DHK_Project/Sinduri/Perspective_Plot_reoccupation_new2.svg', width=8, height=6,  pointsize = 12)
+par(mar=rep(1,4), mai=rep(1,4))
+plot3D::persp3D(z = as.matrix(elev),#elev.extra, 
+                border = 'light grey', lwd = 0.33, 
+                colvar = as.matrix(rdfs),#rfrvals, 
+                phi = 40, theta = -36, 
+                col = c('white', 'red', 'black'), breaks = c(0,1, 33, 100), colkey = FALSE,
+                zlim=c(4,18),
+                expand=0.25, resfac = 0.2,
+        curtain = FALSE, box = T,
+        d = 2, r = 0,
+        legend = FALSE)
+dev.off()
+
+
+## plot3D (190801)
+
+trailz <- st_read(str_c(bdir, 'DHK_Project/Sinduri/Trail_cut_Z.gpkg'))
+trailzdf <- trailz %>% st_coordinates %>% as.data.frame %>% mutate(Z = Z/5)
+svg(str_c(bdir, 'DHK_Project/Sinduri/Perspective_Plot_New_Studyarea_190810.svg'), width=12, height=8,  pointsize = 12)
+plot3D::persp3D(z = as.matrix(egv.elev),#elev.extra, 
+                border = 'light grey', lwd = 0.175, 
+                colvar = as.matrix(season1.invasive.full),#rfrvals, 
+                phi = 30, theta = -40, col = c('white', 'light grey', 'red'), colkey = TRUE,
+                #lighting = list('specular'),
+                zlim=c(4,18),
+                expand=0.2, resfac = 0.33,
+        curtain = FALSE, box = T, labels = NULL,
+        d = 1, r = 0,
+        legend = FALSE)
+scatter3D(trailzdf$X, trailzdf$Y, trailzdf$Z, lwd = 2, col = 'black', type = 'l', add = T, expand = 0.2)
+dev.off()
+
+
+
+colramp <- colorRampPalette(c('white', 'red', 'light blue'))(100)
+
+svg('/mnt/c/Users/sigma/Dropbox/DHK_Project/Sinduri/Perspective_Plot_summary_allseasons2.svg', width=8, height=6,  pointsize = 12)
+par(mar=rep(1,4), mai=rep(1,4))
+plot3D::persp3D(z = as.matrix(elev),#elev.extra, 
+                border = 'light grey', lwd = 0.33, 
+                colvar = as.matrix(rdf.invdun.fin),#rfrvals, 
+                phi = 40, theta = 60, 
+                col = c('white', 'red', 'light blue'),
+                breaks = c(-1, 0.0000, 1.0000, 2.0005),
+                colkey = FALSE,
+                zlim=c(4,18),
+                expand=0.25, resfac = 0.2,
+        curtain = FALSE, box = T,
+        d = 2, r = 0,
+        legend = FALSE)
+dev.off()
+
+
+
+
+
+```
+
+
+```{r air pollution mapping}
+library(automap)
+
+pm10 <- read_csv('/mnt/c/Users/sigma/Dropbox/PM_Project/Traffic/Annual_pollutants/PM10.csv',
+                 locale = locale(encoding = 'EUC-KR'))
+pm25 <- read_csv('/mnt/c/Users/sigma/Dropbox/PM_Project/Traffic/Annual_pollutants/PM25.csv',
+                 locale = locale(encoding = 'EUC-KR'))
+
+pm10_15 <- pm10 %>% filter(YEAR == 2015) %>% 
+  SpatialPointsDataFrame(coords = .[,4:5], data = ., proj4string = CRS('+init=epsg:4326'))
+pm25_15 <- pm25 %>% filter(YEAR == 2015) %>% 
+  SpatialPointsDataFrame(coords = .[,4:5], data = ., proj4string = CRS('+init=epsg:4326'))
+
+drange <- c(126.00, 37.15, 127.50, 37.15, 127.50, 36.15, 126.00, 36.15, 126.00, 37.15)
+drange <- matrix(drange, ncol = 2, byrow = TRUE)
+dpol <- st_polygon(x = list(drange), dim = 'XY') %>% 
+  as(., 'Spatial')
+proj4string(dpol) <- CRS('+init=epsg:4326')
+pm25_15_s <- pm25_15[dpol,]
+pm10_15_s <- pm10_15[dpol,]
+
+
+drange2 <- c(126.00, 37.75, 128.0, 37.75, 128.0, 35.15, 126.00, 35.15, 126.00, 37.75)
+drange2 <- matrix(drange2, ncol = 2, byrow = TRUE)
+dpol2 <- st_polygon(x = list(drange2), dim = 'XY') %>% 
+  as(., 'Spatial')
+proj4string(dpol2) <- CRS('+init=epsg:4326')
+pm25_15_s2 <- pm25_15[dpol2,]
+pm10_15_s2 <- pm10_15[dpol2,]
+
+pm10_15_s2 <- spTransform(pm10_15_s2, CRS('+init=epsg:5179'))
+drange3 <- c(865000, 1905000, 1000000, 1905000, 1000000, 1775000,
+             865000, 1775000, 865000, 1905000) %>% matrix(., ncol = 2, byrow = TRUE)
+dpol3 <- st_polygon(x = list(drange3), dim = 'XY') %>% 
+  as(., 'Spatial')
+proj4string(dpol3) <- CRS('+init=epsg:5179')
+
+bg_grid <- expand.grid(x = seq(865000, 1000000, 100), 
+                       y = seq(1775000, 1905000, 100))
+bg_pixel <- SpatialPixels(points = SpatialPoints(bg_grid), proj4string = CRS('+init=epsg:5179'))
+
+plot(pm10_15_s2)
+
+pm10_15p <- autoKrige(PM10~1, 
+                      input_data = pm10_15_s2, new_data = bg_pixel,
+                      model = c('Ste','Mat','Exp'))
+
+pm10_15pp <- pm10_15p$krige_output
+pm10_15r <- raster(pm10_15pp, layer = 1)
+pm10_15rs <- mask(pm10_15r, sido)
+
+## Fire powerplants
+fpp <- st_read('/mnt/c/Users/sigma/Dropbox/DHK_Project/Sinduri/Fire_Power_Plant.shp')
+st_crs(fpp) <- 5179
+## SD
+sido <- st_read('/mnt/d/2015Census/SGIS2016/bnd_sido_00_2016.shp')
+st_crs(sido) <- 5179
+
+png('/mnt/d/Raster_map_180716_2.png', width=32, height=28, units = 'cm', res = 600, pointsize=20)
+par(mar=rep(0.5,4), mai=rep(0.5,4))
+plot(pm10_15rs,
+     col = colorRampPalette(c('white', 'coral', 'orange red'))(100), 
+     interpolate = TRUE,
+     alpha = 0.75, box = FALSE, axes = FALSE)
+lines(as(sido, 'Spatial'), col = 'dark grey', lwd = 0.6)
+contour(pm10_15rs, add = TRUE)
+scalebar(type = 'bar', divs = 2, d = 20000, lonlat = FALSE, 
+         label = c(0, 10, 20), below = '', xy = c(870000, 1780000))
+points(st_coordinates(fpp), pch = 17, cex=1.2, col = 'dark blue')
+points(st_coordinates(sinduri), pch = 15, cex=1.2, col = 'red')
+#points(coordinates(pm10_15_s2), pch = 23, cex = 0.88, col = 'purple')
+dev.off()
+
+library(dismo)
+sindu <- geocode(x = 'Sinduri, Taean-gun, Chungcheongnam-do')
+sinduri <- sindu %>% .[,3:4] %>% SpatialPoints(coords = .) %>% st_as_sfc
+st_crs(sinduri) <- 4326
+sinduri <- st_transform(sinduri, crs = 5179)
+
+
+
+
+```
+
+
+```{r}
+library(tmap)
+
+palette1 <- colorRampPalette(c('white', 'coral', 'orange red'))(100)
+
+tm_shape(pm10_15rs) + 
+  tm_raster(n = 100, title=expression(Annual ~ PM[10]~ mug / ~m^3 ), 
+            palette = palette1) +
+  #tm_iso(col = 'grey') +
+  tm_shape(sido) + tm_borders(col = 'dark grey', lwd = 0.75) +
+  tm_shape(fpp) + tm_dots(size = 1.2, col = 'red', shape = 17) +
+  tm_shape(sinduri) + tm_dots(size = 1.2, shape = 15, col = 'red') +
+  tm_shape(pm10_15_s2) + tm_dots(size = 0.88, shape = 23, col = 'purple') +
+  tm_legend(legend.outside = TRUE) +
+  tm_compass(position = c('left', 'TOP')) + 
+  tm_scale_bar(width = 0.25, position = c('left', 'BOTTOM'), breaks = c(0, 15, 30)) +
+  tm_layout(frame = FALSE)
+```
+
+
+```{r plot: entire area}
+
+png('D:/EnvRasters.png', width=42, height=30, units = 'cm', res=300, pointsize = 18)
+par(mfrow=c(2,3))
+
+plot(egv.elev, main='Elevation');plot(egv.slope, main='Slope');plot(egv.wind, main='Windward index')
+plot(egv.dist.shore, main='Distance to coast');plot(egv.dist.trail, main='Distance to roads');plot(aspect, main='Aspect')
+par(mfrow=c(1,1))
+dev.off()
+
+
+inv.mask <- raster(str_c(bdir, 'DHK_Project/Sinduri/Once_Invasive_Sinduri.img'))
+png('D:/Mask.png', width=30, height=33, units = 'cm', res=300, pointsize = 18)
+par(mfrow=c(1,1))
+
+plot(inv.mask, main='Invasive species', col=c('beige','red'), breaks=c(0,0.5,1))
+dev.off()
+```
+
+
+```{r Inv-Dune plot}
+writeRaster()
+
+png('/mnt/c/Users/sigma/Dropbox/DHK_Project/Sinduri/1_Invasive_2_Dune.png', width=24, height=25, units = 'cm', res = 300, pointsize=16)
+plot(rdf.invdun)
+dev.off()
+
+# Validity test
+rdf.test <- rdf.inv + rdf.dune
+
+
+```
+
